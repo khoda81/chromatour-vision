@@ -1,7 +1,7 @@
 [project]
 name = "color-cv"
 version = "0.1.0"
-description = "Add your description here"
+description = "Color calibration, correction, and swatch extraction for Chromatour."
 readme = "README.md"
 authors = [
     { name = "axiom", email = "20.mahdikh.0@gmail.com" }
@@ -20,3 +20,6 @@ color-cv = "color_cv:main"
 [build-system]
 requires = ["uv_build>=0.12.5,<0.13.0"]
 build-backend = "uv_build"
+
+[tool.ruff]
+target-version = "py313"
