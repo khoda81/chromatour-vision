@@ -1,0 +1,22 @@
+[project]
+name = "color-cv"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "axiom", email = "20.mahdikh.0@gmail.com" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "matplotlib>=3.11.1",
+    "numpy>=2.5.2",
+    "pillow>=12.3.0",
+    "plotly>=6.9.0",
+]
+
+[project.scripts]
+color-cv = "color_cv:main"
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
