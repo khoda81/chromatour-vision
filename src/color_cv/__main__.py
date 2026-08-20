@@ -3,7 +3,8 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import plotly.graph_objects as go
-from matplotlib.widgets import RectangleSelector
+from matplotlib.path import Path as MplPath
+from matplotlib.widgets import PolygonSelector
 from PIL import Image, ImageCms, ImageOps
 from plotly.subplots import make_subplots
 
@@ -158,43 +159,57 @@ def choose_neutral(image, radius=15):
     return (x, y), (slice(y0, y1), slice(x0, x1))
 
 
+def polygon_to_mask(shape, vertices):
+    vertices = np.asarray(vertices, dtype=np.float64)
+    if len(vertices) < 3:
+        raise ValueError("A polygon needs at least three vertices")
+
+    height, width = shape[:2]
+    x0 = max(0, int(np.floor(vertices[:, 0].min())))
+    x1 = min(width, int(np.ceil(vertices[:, 0].max())) + 1)
+    y0 = max(0, int(np.floor(vertices[:, 1].min())))
+    y1 = min(height, int(np.ceil(vertices[:, 1].max())) + 1)
+
+    if x1 <= x0 or y1 <= y0:
+        raise ValueError("Polygon is outside the image")
+
+    yy, xx = np.mgrid[y0:y1, x0:x1]
+    points = np.column_stack((xx.ravel(), yy.ravel()))
+    local_mask = MplPath(vertices).contains_points(points, radius=1e-9)
+    local_mask = local_mask.reshape(y1 - y0, x1 - x0)
+
+    mask = np.zeros((height, width), dtype=bool)
+    mask[y0:y1, x0:x1] = local_mask
+    return mask
+
+
 def choose_roi(image):
     selection = {}
     fig, ax = plt.subplots(figsize=(12, 8))
     ax.imshow(image)
-    ax.set_title("Drag a rectangle inside one colored object")
+    ax.set_title(
+        "Click around one colored object; click the first point again to close the polygon"
+    )
     ax.axis("off")
 
-    def on_select(start, end):
-        x0, x1 = sorted((round(start.xdata), round(end.xdata)))
-        y0, y1 = sorted((round(start.ydata), round(end.ydata)))
+    def on_select(vertices):
+        if len(vertices) < 3:
+            return
 
-        x0 = max(0, min(image.shape[1], x0))
-        x1 = max(0, min(image.shape[1], x1))
-        y0 = max(0, min(image.shape[0], y0))
-        y1 = max(0, min(image.shape[0], y1))
-
-        if x1 > x0 and y1 > y0:
-            selection["roi"] = (slice(y0, y1), slice(x0, x1))
+        mask = polygon_to_mask(image.shape, vertices)
+        if mask.any():
+            selection["mask"] = mask
+            selection["vertices"] = np.asarray(vertices)
             plt.close(fig)
 
-    selector = RectangleSelector(
-        ax,
-        on_select,
-        useblit=True,
-        button=[1],
-        minspanx=5,
-        minspany=5,
-        spancoords="pixels",
-        interactive=False,
-    )
+    selector = PolygonSelector(ax, on_select, useblit=True)
     plt.show()
-    selector.set_active(False)
+    selector.disconnect_events()
 
-    if "roi" not in selection:
+    if "mask" not in selection:
         raise RuntimeError("No ROI selected")
 
-    return selection["roi"]
+    return selection["mask"], selection["vertices"]
 
 
 def white_balance_from_neutral(linear_rgb, patch):
@@ -220,8 +235,8 @@ def white_balance_from_neutral(linear_rgb, patch):
 # ---------- ROI color estimation ----------
 
 
-def estimate_roi_color(oklab, roi, trim=0.1):
-    pixels = oklab[roi].reshape(-1, 3)
+def estimate_roi_color(oklab, mask, trim=0.1):
+    pixels = oklab[mask]
     pixels = pixels[np.isfinite(pixels).all(axis=1)]
 
     if not len(pixels):
@@ -238,10 +253,10 @@ def srgb_to_hex(srgb):
     return "#{:02X}{:02X}{:02X}".format(*rgb8)
 
 
-def make_overlay(preview, roi, estimated_oklab, alpha=0.5):
+def make_overlay(preview, mask, estimated_oklab, alpha=0.5):
     overlay = preview.copy()
     estimated_srgb = np.clip(oklab_to_srgb(estimated_oklab), 0, 1)
-    overlay[roi] = (1 - alpha) * overlay[roi] + alpha * estimated_srgb
+    overlay[mask] = (1 - alpha) * overlay[mask] + alpha * estimated_srgb
     return overlay
 
 
@@ -405,18 +420,19 @@ def main(path):
     print("Bradford matrix:")
     print(matrix)
 
-    roi = choose_roi(preview)
-    estimated_color, roi_pixels, kept_pixels = estimate_roi_color(oklab, roi)
+    roi_mask, roi_vertices = choose_roi(preview)
+    estimated_color, roi_pixels, kept_pixels = estimate_roi_color(oklab, roi_mask)
     estimated_srgb = oklab_to_srgb(estimated_color)
-    overlay = make_overlay(preview, roi, estimated_color)
+    overlay = make_overlay(preview, roi_mask, estimated_color)
 
+    print(f"ROI vertices: {len(roi_vertices)}")
     print(f"ROI pixels: {len(roi_pixels):,}")
     print(f"Pixels after lightness trim: {len(kept_pixels):,}")
     print(f"Estimated OKLab: {estimated_color}")
     print(f"Estimated sRGB: {estimated_srgb}")
     print(f"Estimated hex: {srgb_to_hex(estimated_srgb)}")
 
-    roi_srgb = preview[roi]
+    roi_srgb = preview[roi_mask]
     write_roi_diagnostics(
         artifacts / "roi_diagnostics.html",
         roi_pixels,
