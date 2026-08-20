@@ -222,10 +222,7 @@ def white_balance_from_neutral(linear_rgb, patch):
     # Brightness of the gray object is irrelevant.
     source_white = neutral_xyz / neutral_xyz[1]
 
-    adaptation = chromatic_adaptation_matrix(
-        source_white,
-        D65,
-    )
+    adaptation = chromatic_adaptation_matrix(source_white, D65)
 
     corrected_xyz = xyz @ adaptation.T
 
