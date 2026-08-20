@@ -2,7 +2,10 @@ from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
+import plotly.graph_objects as go
+from matplotlib.widgets import RectangleSelector
 from PIL import Image, ImageCms, ImageOps
+from plotly.subplots import make_subplots
 
 # ---------- sRGB / XYZ ----------
 
@@ -85,11 +88,26 @@ LMS_TO_OKLAB = np.array(
     ]
 )
 
+LMS_TO_XYZ_OKLAB = np.linalg.inv(XYZ_TO_LMS_OKLAB)
+OKLAB_TO_LMS = np.linalg.inv(LMS_TO_OKLAB)
+
 
 def xyz_to_oklab(xyz):
     lms = xyz @ XYZ_TO_LMS_OKLAB.T
     lms_root = np.cbrt(lms)
     return lms_root @ LMS_TO_OKLAB.T
+
+
+def oklab_to_xyz(oklab):
+    lms_root = np.asarray(oklab) @ OKLAB_TO_LMS.T
+    lms = lms_root**3
+    return lms @ LMS_TO_XYZ_OKLAB.T
+
+
+def oklab_to_srgb(oklab):
+    xyz = oklab_to_xyz(oklab)
+    linear_rgb = xyz_to_rgb(xyz)
+    return linear_to_srgb(linear_rgb)
 
 
 # ---------- image loading ----------
@@ -140,6 +158,45 @@ def choose_neutral(image, radius=15):
     return (x, y), (slice(y0, y1), slice(x0, x1))
 
 
+def choose_roi(image):
+    selection = {}
+    fig, ax = plt.subplots(figsize=(12, 8))
+    ax.imshow(image)
+    ax.set_title("Drag a rectangle inside one colored object")
+    ax.axis("off")
+
+    def on_select(start, end):
+        x0, x1 = sorted((round(start.xdata), round(end.xdata)))
+        y0, y1 = sorted((round(start.ydata), round(end.ydata)))
+
+        x0 = max(0, min(image.shape[1], x0))
+        x1 = max(0, min(image.shape[1], x1))
+        y0 = max(0, min(image.shape[0], y0))
+        y1 = max(0, min(image.shape[0], y1))
+
+        if x1 > x0 and y1 > y0:
+            selection["roi"] = (slice(y0, y1), slice(x0, x1))
+            plt.close(fig)
+
+    selector = RectangleSelector(
+        ax,
+        on_select,
+        useblit=True,
+        button=[1],
+        minspanx=5,
+        minspany=5,
+        spancoords="pixels",
+        interactive=False,
+    )
+    plt.show()
+    selector.set_active(False)
+
+    if "roi" not in selection:
+        raise RuntimeError("No ROI selected")
+
+    return selection["roi"]
+
+
 def white_balance_from_neutral(linear_rgb, patch):
     xyz = rgb_to_xyz(linear_rgb)
 
@@ -160,8 +217,171 @@ def white_balance_from_neutral(linear_rgb, patch):
     return corrected_xyz, source_white, adaptation
 
 
+# ---------- ROI color estimation ----------
+
+
+def estimate_roi_color(oklab, roi, trim=0.1):
+    pixels = oklab[roi].reshape(-1, 3)
+    pixels = pixels[np.isfinite(pixels).all(axis=1)]
+
+    if not len(pixels):
+        raise ValueError("ROI contains no valid pixels")
+
+    low, high = np.quantile(pixels[:, 0], [trim, 1 - trim])
+    kept = pixels[(pixels[:, 0] >= low) & (pixels[:, 0] <= high)]
+
+    return np.median(kept, axis=0), pixels, kept
+
+
+def srgb_to_hex(srgb):
+    rgb8 = np.round(np.clip(srgb, 0, 1) * 255).astype(np.uint8)
+    return "#{:02X}{:02X}{:02X}".format(*rgb8)
+
+
+def make_overlay(preview, roi, estimated_oklab, alpha=0.5):
+    overlay = preview.copy()
+    estimated_srgb = np.clip(oklab_to_srgb(estimated_oklab), 0, 1)
+    overlay[roi] = (1 - alpha) * overlay[roi] + alpha * estimated_srgb
+    return overlay
+
+
+def _sample_indices(size, limit=5000):
+    if size <= limit:
+        return np.arange(size)
+    return np.linspace(0, size - 1, limit, dtype=int)
+
+
+def _rgb_strings(rgb):
+    rgb8 = np.round(np.clip(rgb, 0, 1) * 255).astype(np.uint8)
+    return [f"rgb({r},{g},{b})" for r, g, b in rgb8]
+
+
+def write_roi_diagnostics(path, pixels, roi_srgb, estimated_oklab):
+    indices = _sample_indices(len(pixels))
+    sample = pixels[indices]
+    sample_rgb = roi_srgb.reshape(-1, 3)[indices]
+    colors = _rgb_strings(sample_rgb)
+
+    lightness = sample[:, 0]
+    chroma = np.linalg.norm(sample[:, 1:], axis=1)
+    safe_lightness = np.where(np.abs(lightness) > 1e-8, lightness, np.nan)
+
+    fig = make_subplots(
+        rows=1,
+        cols=3,
+        subplot_titles=(
+            "OKLab chroma plane",
+            "Shading-normalized chroma",
+            "Lightness vs chroma",
+        ),
+    )
+
+    marker = {"color": colors, "size": 4, "opacity": 0.45}
+    hover = "L=%{customdata[0]:.4f}<br>a=%{customdata[1]:.4f}<br>b=%{customdata[2]:.4f}<extra></extra>"
+
+    fig.add_trace(
+        go.Scattergl(
+            x=sample[:, 1],
+            y=sample[:, 2],
+            mode="markers",
+            marker=marker,
+            customdata=sample,
+            hovertemplate=hover,
+            name="ROI pixels",
+            showlegend=False,
+        ),
+        row=1,
+        col=1,
+    )
+    fig.add_trace(
+        go.Scattergl(
+            x=sample[:, 1] / safe_lightness,
+            y=sample[:, 2] / safe_lightness,
+            mode="markers",
+            marker=marker,
+            customdata=sample,
+            hovertemplate=hover,
+            name="ROI pixels",
+            showlegend=False,
+        ),
+        row=1,
+        col=2,
+    )
+    fig.add_trace(
+        go.Scattergl(
+            x=lightness,
+            y=chroma,
+            mode="markers",
+            marker=marker,
+            customdata=sample,
+            hovertemplate=hover,
+            name="ROI pixels",
+            showlegend=False,
+        ),
+        row=1,
+        col=3,
+    )
+
+    estimate_chroma = np.linalg.norm(estimated_oklab[1:])
+    estimate_l = estimated_oklab[0]
+    estimate_marker = {
+        "color": srgb_to_hex(oklab_to_srgb(estimated_oklab)),
+        "size": 14,
+        "symbol": "x",
+        "line": {"width": 2},
+    }
+
+    fig.add_trace(
+        go.Scatter(
+            x=[estimated_oklab[1]],
+            y=[estimated_oklab[2]],
+            mode="markers",
+            marker=estimate_marker,
+            name="estimate",
+        ),
+        row=1,
+        col=1,
+    )
+    if abs(estimate_l) > 1e-8:
+        fig.add_trace(
+            go.Scatter(
+                x=[estimated_oklab[1] / estimate_l],
+                y=[estimated_oklab[2] / estimate_l],
+                mode="markers",
+                marker=estimate_marker,
+                name="estimate",
+                showlegend=False,
+            ),
+            row=1,
+            col=2,
+        )
+    fig.add_trace(
+        go.Scatter(
+            x=[estimate_l],
+            y=[estimate_chroma],
+            mode="markers",
+            marker=estimate_marker,
+            name="estimate",
+            showlegend=False,
+        ),
+        row=1,
+        col=3,
+    )
+
+    fig.update_xaxes(title_text="a", row=1, col=1)
+    fig.update_yaxes(title_text="b", row=1, col=1)
+    fig.update_xaxes(title_text="a / L", row=1, col=2)
+    fig.update_yaxes(title_text="b / L", row=1, col=2)
+    fig.update_xaxes(title_text="L", row=1, col=3)
+    fig.update_yaxes(title_text="C", row=1, col=3)
+    fig.update_layout(title="ROI color diagnostics", height=560)
+    fig.write_html(path, include_plotlyjs=True)
+
+
 def main(path):
-    ARTIFACTS = Path("artifacts")
+    artifacts = Path("artifacts")
+    artifacts.mkdir(parents=True, exist_ok=True)
+
     srgb = load_srgb(path)
     linear = srgb_to_linear(srgb)
 
@@ -185,26 +405,44 @@ def main(path):
     print("Bradford matrix:")
     print(matrix)
 
+    roi = choose_roi(preview)
+    estimated_color, roi_pixels, kept_pixels = estimate_roi_color(oklab, roi)
+    estimated_srgb = oklab_to_srgb(estimated_color)
+    overlay = make_overlay(preview, roi, estimated_color)
+
+    print(f"ROI pixels: {len(roi_pixels):,}")
+    print(f"Pixels after lightness trim: {len(kept_pixels):,}")
+    print(f"Estimated OKLab: {estimated_color}")
+    print(f"Estimated sRGB: {estimated_srgb}")
+    print(f"Estimated hex: {srgb_to_hex(estimated_srgb)}")
+
+    roi_srgb = preview[roi]
+    write_roi_diagnostics(
+        artifacts / "roi_diagnostics.html",
+        roi_pixels,
+        roi_srgb,
+        estimated_color,
+    )
+
     _fig, axes = plt.subplots(1, 2, figsize=(16, 8))
-
-    axes[0].imshow(srgb)
-    axes[0].set_title("Original")
-
-    axes[1].imshow(preview)
-    axes[1].set_title("Chromatically adapted → D65")
-
+    axes[0].imshow(preview)
+    axes[0].set_title("Chromatically adapted → D65")
+    axes[1].imshow(overlay)
+    axes[1].set_title(f"50% estimated-color overlay — {srgb_to_hex(estimated_srgb)}")
     for ax in axes:
         ax.axis("off")
-
     plt.tight_layout()
     plt.show()
 
     # Keep the floating-point measurement representation.
-    np.save(ARTIFACTS / "corrected_xyz.npy", corrected_xyz)
-    np.save(ARTIFACTS / "corrected_oklab.npy", oklab)
+    np.save(artifacts / "corrected_xyz.npy", corrected_xyz)
+    np.save(artifacts / "corrected_oklab.npy", oklab)
 
     Image.fromarray(np.round(preview * 255).astype(np.uint8)).save(
-        ARTIFACTS / "corrected_preview.png"
+        artifacts / "corrected_preview.png"
+    )
+    Image.fromarray(np.round(overlay * 255).astype(np.uint8)).save(
+        artifacts / "roi_overlay.png"
     )
 
 
